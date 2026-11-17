@@ -1,0 +1,11 @@
+[server]
+# Watching this folder recursively includes .venv (thousands of directories) and
+# overflows the inotify queue. The demo does not need auto-reload on file changes.
+fileWatcherType = "none"
+
+[theme]
+base = "dark"
+primaryColor = "#7C5CFF"
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161B26"
+textColor = "#E6E9F2"

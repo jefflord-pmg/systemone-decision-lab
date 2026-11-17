@@ -1,0 +1,361 @@
+"""SYSTEMONE DECISION LAB: a Streamlit dashboard for a local strands-decider server.
+
+The model is reached only over HTTP through api_client; nothing here loads it.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+
+import altair as alt
+import pandas as pd
+import streamlit as st
+
+import hardware
+from api_client import (
+    DeciderClient,
+    DeciderError,
+    Question,
+    QuestionError,
+    parse_levels,
+    parse_options,
+    slugify,
+)
+from config import get_settings
+from scenarios import SCENARIOS
+
+CUSTOM = "Custom (blank)"
+TYPE_LABELS = {"noul": "NOUL · yes/no", "choice": "CHOICE · pick one", "score": "SCORE · ordered scale"}
+ACCENT = "#7C5CFF"
+MUTED = "#3A3F55"
+
+st.set_page_config(page_title="SystemOne Decision Lab", page_icon="◆", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 2rem; max-width: 1400px;}
+    .lab-title {font-size: 2.1rem; font-weight: 800; letter-spacing: .18em; margin: 0;
+        background: linear-gradient(90deg, #7C5CFF, #22D3EE); -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;}
+    .lab-sub {color: #9AA3B8; margin-top: -.2rem; margin-bottom: 1.2rem;}
+    .pill {display: inline-block; padding: .15rem .65rem; border-radius: 999px;
+        font-size: .8rem; font-weight: 700; letter-spacing: .05em;}
+    .pill-on {background: rgba(34,197,94,.15); color: #4ADE80; border: 1px solid #22C55E;}
+    .pill-off {background: rgba(239,68,68,.12); color: #F87171; border: 1px solid #EF4444;}
+    .pill-type {background: rgba(124,92,255,.15); color: #B4A2FF; border: 1px solid #7C5CFF;}
+    .big-answer {font-size: 1.9rem; font-weight: 800; line-height: 1.1; margin: .2rem 0 .4rem 0;}
+    .caption {color: #9AA3B8; font-size: .85rem;}
+    div[data-testid="stMetricValue"] {font-size: 1.15rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+settings = get_settings()
+
+
+@st.cache_resource
+def get_client() -> DeciderClient:
+    return DeciderClient(settings.endpoint, settings.health_url, timeout=settings.timeout)
+
+
+@st.cache_data(show_spinner=False)
+def get_hardware(device: str) -> dict:
+    return hardware.collect(device)
+
+
+client = get_client()
+
+
+# ---------------------------------------------------------------- session state
+
+def _question_entry(q: Question) -> dict:
+    return {"uid": uuid.uuid4().hex[:8], "key": q.key, "type": q.type,
+            "instructions": q.instructions, "criteria": q.criteria}
+
+
+def load_scenario() -> None:
+    name = st.session_state.scenario
+    if name == CUSTOM:
+        st.session_state.state_text = ""
+        st.session_state.questions = [_question_entry(Question("question_1", "noul", ""))]
+    else:
+        scenario = SCENARIOS[name]
+        st.session_state.state_text = scenario["state"]
+        st.session_state.questions = [_question_entry(q) for q in scenario["questions"]]
+    st.session_state.result = None
+    st.session_state.error = None
+
+
+if "questions" not in st.session_state:
+    st.session_state.scenario = next(iter(SCENARIOS))
+    st.session_state.decisions = 0
+    st.session_state.last_latency = None
+    load_scenario()
+
+
+def add_question(kind: str) -> None:
+    n = len(st.session_state.questions) + 1
+    criteria = {"choice": {}, "score": []}.get(kind)
+    st.session_state.questions.append(_question_entry(Question(f"question_{n}", kind, "", criteria)))
+
+
+def remove_question(uid: str) -> None:
+    st.session_state.questions = [q for q in st.session_state.questions if q["uid"] != uid]
+
+
+def _criteria_text(entry: dict, kind: str) -> str:
+    criteria = entry["criteria"] if entry["type"] == kind else None
+    if kind == "choice" and isinstance(criteria, dict):
+        return "\n".join(f"{k}: {v}" if v else k for k, v in criteria.items())
+    if kind == "score" and isinstance(criteria, list):
+        return "\n".join(criteria)
+    return ""
+
+
+# ---------------------------------------------------------------- header + status
+
+st.markdown('<p class="lab-title">SYSTEMONE DECISION LAB</p>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="lab-sub">Structured decisions from a small local model: '
+    "<b>noul</b> (yes/no probability), <b>choice</b> (one of N) and <b>score</b> "
+    "(ordered scale).</p>",
+    unsafe_allow_html=True,
+)
+
+
+@st.fragment(run_every="5s")
+def status_bar() -> None:
+    health = client.health()
+    info = health.info
+    cols = st.columns([1.1, 2.4, 0.9, 2.2, 1.2, 1])
+    with cols[0]:
+        st.caption("Model status")
+        pill = '<span class="pill pill-on">● ONLINE</span>' if health.online else \
+            '<span class="pill pill-off">● OFFLINE</span>'
+        st.markdown(pill, unsafe_allow_html=True)
+    cols[1].metric("Model", info.get("model") or settings.model.split("/")[-1],
+                   help=f"Configured: {settings.model}")
+    cols[2].metric("Device", str(info.get("device") or settings.device).upper(),
+                   help="Reported by /health when online; otherwise DECIDER_DEVICE.")
+    cols[3].metric("Endpoint", settings.endpoint.replace("http://", ""))
+    last = st.session_state.last_latency
+    cols[4].metric("Last request", f"{last:,.0f} ms" if last is not None else "—",
+                   help="Client round-trip time of the most recent decision.")
+    cols[5].metric("Decisions", st.session_state.decisions, help="Requests made this session.")
+    if not health.online:
+        st.warning(
+            f"{health.error}. Start the server with `./start-model.sh`. Its port opens only "
+            "after the model has loaded and warmed up, which can take minutes on CPU.",
+            icon="⏳",
+        )
+
+
+status_bar()
+
+
+# ---------------------------------------------------------------- sidebar
+
+with st.sidebar:
+    st.subheader("Scenario")
+    st.selectbox("Load a scenario", [*SCENARIOS, CUSTOM], key="scenario",
+                 on_change=load_scenario, label_visibility="collapsed")
+    st.caption("Demo inputs only. Answers come from the model, not from the scenario.")
+
+    st.subheader("Hardware")
+    hw = get_hardware(settings.device)
+    rows = {
+        "Operating system": hw["os"],
+        "Python": hw["python"],
+        "PyTorch": f"{hw['torch_version'] or 'not installed'} ({hw['torch_build'] or 'n/a'})",
+        "CUDA available": "yes" if hw["cuda_available"] else "no",
+        "ROCm/HIP available": "yes" if hw["rocm_available"] else "no",
+        "NVIDIA GPU": ", ".join(hw["nvidia_gpus"]) or "none found",
+        "AMD GPU": ", ".join(hw["amd_gpus"]) or "none found",
+        "Configured device": hw["configured_device"],
+    }
+    st.markdown("\n".join(f"- **{k}:** {v}" for k, v in rows.items()))
+    if hw["amd_gpus"] and not hw["rocm_available"]:
+        st.info("An AMD GPU is present, but this PyTorch build cannot use it.")
+    if hw["nvidia_gpus"] and not hw["cuda_available"]:
+        st.info("An NVIDIA GPU is present, but this PyTorch build cannot use it. "
+                "Run `./setup.sh --cuda` to install a CUDA build.")
+    st.caption("PyTorch details describe this app's environment; the device the model "
+               "actually runs on is shown in the status bar.")
+
+
+# ---------------------------------------------------------------- inputs
+
+left, right = st.columns([1, 1.25], gap="large")
+
+with left:
+    st.subheader("A · Scenario")
+    st.text_area("Situation", key="state_text", height=180,
+                 placeholder="Describe the situation the model should decide about…")
+
+    st.subheader("C · Run")
+    run = st.button("Run decision", type="primary", width="stretch")
+    st.caption(f"All questions go in one POST to `{settings.endpoint}`. "
+               f"Timeout {settings.timeout:.0f} s.")
+
+with right:
+    st.subheader("B · Decision builder")
+    for i, entry in enumerate(st.session_state.questions):
+        uid = entry["uid"]
+        with st.container(border=True):
+            top = st.columns([1.3, 1.2, 0.35])
+            entry["type"] = top[0].selectbox(
+                "Type", list(TYPE_LABELS), format_func=TYPE_LABELS.get,
+                index=list(TYPE_LABELS).index(entry["type"]), key=f"type_{uid}")
+            entry["key"] = top[1].text_input("Key", value=entry["key"], key=f"key_{uid}",
+                                             help="Name of this question in the request/response.")
+            top[2].button("✕", key=f"rm_{uid}", on_click=remove_question, args=(uid,),
+                          help="Remove question")
+            entry["instructions"] = st.text_input(
+                "Question", value=entry["instructions"], key=f"q_{uid}",
+                placeholder="e.g. Is this urgent?")
+            kind = entry["type"]
+            if kind == "choice":
+                text = st.text_area(
+                    "Options (one per line, optionally `label: description`)",
+                    value=_criteria_text(entry, "choice"), key=f"opts_choice_{uid}", height=100,
+                    placeholder="billing: Payment and money issues\ntechnical\nsales")
+                entry["criteria"] = parse_options(text)
+            elif kind == "score":
+                text = st.text_area(
+                    "Levels, lowest first (one per line or comma-separated, 2–10)",
+                    value=_criteria_text(entry, "score"), key=f"opts_score_{uid}", height=100,
+                    placeholder="low\nmedium\nhigh")
+                entry["criteria"] = parse_levels(text)
+            else:
+                entry["criteria"] = None
+
+    add = st.columns(3)
+    for col, kind in zip(add, TYPE_LABELS):
+        col.button(f"+ {kind.upper()}", key=f"add_{kind}", on_click=add_question, args=(kind,),
+                   width="stretch")
+
+
+# ---------------------------------------------------------------- run
+
+if run:
+    questions = [
+        Question(slugify(e["key"], f"question_{i + 1}"), e["type"], e["instructions"],
+                 e["criteria"])
+        for i, e in enumerate(st.session_state.questions)
+    ]
+    st.session_state.error = None
+    try:
+        with st.spinner("Asking the model… (CPU inference can take a while)"):
+            result = client.decide(st.session_state.state_text, questions)
+    except (QuestionError, DeciderError) as exc:
+        st.session_state.error = str(exc)
+        st.session_state.result = None
+    else:
+        st.session_state.result = {"data": result.data, "round_trip_ms": result.round_trip_ms,
+                                   "server_ms": result.server_latency_ms,
+                                   "questions": questions}
+        st.session_state.decisions += 1
+        st.session_state.last_latency = result.round_trip_ms
+    st.rerun()
+
+
+# ---------------------------------------------------------------- results
+
+def _bar_chart(df: pd.DataFrame, highlight: str | None, ordered: bool) -> alt.Chart:
+    sort = list(df["label"]) if ordered else "-x"
+    color = alt.condition(alt.datum.label == highlight, alt.value(ACCENT), alt.value(MUTED)) \
+        if highlight is not None else alt.value(ACCENT)
+    base = alt.Chart(df).encode(
+        y=alt.Y("label:N", sort=sort, title=None, axis=alt.Axis(labelLimit=220)),
+        x=alt.X("probability:Q", scale=alt.Scale(domain=[0, 1]), title="probability",
+                axis=alt.Axis(format="%")),
+        tooltip=[alt.Tooltip("label:N"), alt.Tooltip("probability:Q", format=".2%")],
+    )
+    bars = base.mark_bar(cornerRadiusEnd=4).encode(color=color)
+    text = base.mark_text(align="left", dx=4, color="#C9CFDD").encode(
+        text=alt.Text("probability:Q", format=".1%"))
+    return (bars + text).properties(height=max(90, 34 * len(df)))
+
+
+def render_answer(question: Question, answer: dict) -> None:
+    kind = answer.get("type")
+    with st.container(border=True):
+        st.markdown(f'<span class="pill pill-type">{kind.upper()}</span> &nbsp;'
+                    f"<b>{question.instructions}</b> <span class='caption'>· {question.key}</span>",
+                    unsafe_allow_html=True)
+        if kind == "noul":
+            p = float(answer["noul"])
+            c1, c2 = st.columns([1, 2])
+            c1.markdown(f'<div class="big-answer">{"YES" if p >= 0.5 else "NO"}</div>'
+                        f'<div class="caption">leaning, at the 50% line</div>',
+                        unsafe_allow_html=True)
+            c2.metric("P(yes)", f"{p:.1%}")
+            c2.progress(min(max(p, 0.0), 1.0))
+            st.caption("The API returns only P(yes) for noul questions; no separate confidence.")
+        elif kind == "choice":
+            probs = answer["probabilities"]
+            c1, c2, c3 = st.columns([1.4, 1, 1])
+            c1.markdown(f'<div class="caption">Selected answer</div>'
+                        f'<div class="big-answer">{answer["choice"]}</div>',
+                        unsafe_allow_html=True)
+            c2.metric("Probability", f"{probs.get(answer['choice'], 0):.1%}")
+            if "confidence" in answer:
+                c3.metric("Confidence", f"{answer['confidence']:.3f}",
+                          help="Reported by the API: 0 = even split, 1 = certain.")
+            df = pd.DataFrame({"label": list(probs), "probability": list(probs.values())})
+            st.altair_chart(_bar_chart(df, answer["choice"], ordered=False),
+                            width="stretch")
+        elif kind == "score":
+            legend = answer["legend"]
+            probs = answer["probabilities"]
+            idx = sorted(legend, key=int)
+            top = max(idx, key=lambda k: probs.get(k, 0))
+            max_level = len(idx) - 1
+            score = float(answer["score"])
+            c1, c2, c3 = st.columns([1.4, 1, 1])
+            c1.markdown(f'<div class="caption">Most likely level</div>'
+                        f'<div class="big-answer">{legend[top]}</div>',
+                        unsafe_allow_html=True)
+            c2.metric("Expected score", f"{score:.2f} / {max_level}",
+                      help="Expected value over level indices (0 = lowest), from the API.")
+            if "confidence" in answer:
+                c3.metric("Confidence", f"{answer['confidence']:.3f}",
+                          help="Reported by the API: how tightly the mass clusters on the scale.")
+            st.progress(min(max(score / max_level if max_level else 0, 0.0), 1.0),
+                        text=f"{legend[idx[0]]} → {legend[idx[-1]]}")
+            df = pd.DataFrame({"label": [f"{k}: {legend[k]}" for k in idx],
+                               "probability": [probs.get(k, 0.0) for k in idx]})
+            st.altair_chart(_bar_chart(df, f"{top}: {legend[top]}", ordered=True),
+                            width="stretch")
+
+
+st.divider()
+st.subheader("D · Results")
+
+if st.session_state.error:
+    st.error(st.session_state.error, icon="⚠️")
+
+result = st.session_state.get("result")
+if result:
+    data = result["data"]
+    usage = data.get("usage", {})
+    m = st.columns(4)
+    m[0].metric("Round trip", f"{result['round_trip_ms']:,.0f} ms", help="Measured by this app.")
+    m[1].metric("Server latency",
+                f"{result['server_ms']:,.0f} ms" if result["server_ms"] is not None else "—",
+                help="latency_ms reported by the server.")
+    m[2].metric("Input tokens", usage.get("input_tokens", "—"))
+    m[3].metric("Model", data.get("model", "—"))
+
+    cols = st.columns(2)
+    for i, q in enumerate(result["questions"]):
+        with cols[i % 2]:
+            render_answer(q, data["answers"][q.key])
+
+    with st.expander("Raw JSON response"):
+        st.code(json.dumps(data, indent=2), language="json")
+elif not st.session_state.error:
+    st.info("Build your questions and press **Run decision**. Results appear here.")

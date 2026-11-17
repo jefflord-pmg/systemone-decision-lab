@@ -1,0 +1,5 @@
+# PyTorch is installed separately by setup.sh from the CPU-only wheel index.
+strands-decider==0.3.0
+streamlit>=1.40
+requests>=2.32
+pytest>=8.0
