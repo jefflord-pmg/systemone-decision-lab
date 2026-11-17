@@ -37,7 +37,9 @@ Two separate processes:
    GET  /health
 ```
 
-The Streamlit app never imports or loads the model; it only calls the server over HTTP.
+The Streamlit app never imports or loads the model; it only calls the server over HTTP. The
+model server can also be an OpenDecider model served locally or via LM Studio — see
+[Decision backends](#decision-backends-and-side-by-side-comparison).
 
 ## Requirements
 
@@ -57,7 +59,7 @@ The Streamlit app never imports or loads the model; it only calls the server ove
 ```
 
 This creates `.venv` with Python 3.12, installs PyTorch, then `requirements.txt`
-(strands-decider, Streamlit, requests, pytest), and copies `.env.example` to `.env`. With
+(strands-decider, OpenDecider, Streamlit, requests, pytest), and copies `.env.example` to `.env`. With
 `--cuda` it installs the CUDA build of PyTorch and runs a GPU check. If the check passes, it
 sets `DECIDER_DEVICE=cuda` in `.env`; if it fails, the device stays `cpu`. See
 [GPU and other machines](#gpu-and-other-machines).
@@ -70,10 +72,13 @@ sets `DECIDER_DEVICE=cuda` in `.env`; if it fails, the device stays `cpu`. See
 ./start-model.sh
 ```
 
-It prints hardware diagnostics, then starts `strands-decider serve`. The first run downloads
-the model. The server opens its port only after the model has loaded **and warmed up**,
-which takes a few minutes on CPU. Until then, the dashboard shows OFFLINE. It is ready when
-the log shows `Uvicorn running on http://127.0.0.1:8000`. To check by hand:
+It prints hardware diagnostics, then starts `strands-decider serve`. With
+`DECIDER_POOL_SIZE>1` it starts that many servers on consecutive ports, waits for all of them
+to load and warm up, and puts a round-robin proxy on `DECIDER_PORT`, so the dashboard needs no
+change. The first run downloads the model. The server opens its port only after the model has
+loaded **and warmed up**, which takes a few minutes on CPU. Until then, the dashboard shows
+OFFLINE. It is ready when the log shows `Uvicorn running on http://127.0.0.1:8000` (for a pool,
+`All N model servers ready...`). To check by hand:
 
 ```bash
 curl -s localhost:8000/health
@@ -105,11 +110,84 @@ Settings live in `.env` (see `.env.example`). Both scripts and the app read them
 |---|---|---|
 | `DECIDER_MODEL` | `StrandsAgents/strands-decider-2B-qwen3.5-v1-2610` | Hub id or local checkpoint. `StrandsAgents/strands-decider-2B-hobson-v19` also works. |
 | `DECIDER_DEVICE` | `cpu` | `--device` for the server: `cpu`, `cuda`, `mps` |
-| `DECIDER_HOST` / `DECIDER_PORT` | `127.0.0.1` / `8000` | Where the server listens |
+| `DECIDER_HOST` / `DECIDER_PORT` | `127.0.0.1` / `8000` | Where the server (or pool proxy) listens |
+| `DECIDER_POOL_SIZE` | `1` | Independent server processes; each loads its own model copy. `2`–`4` can raise throughput on a large GPU |
 | `DECIDER_ENDPOINT` | `http://127.0.0.1:8000/v1/systemone` | What the app calls; `/health` is derived from it |
 | `DECIDER_MAX_BATCH` | `8` | Questions per forward pass. Warm-up covers every size up to this, so smaller means faster startup |
 | `DECIDER_NO_WARMUP` | `0` | `1` skips warm-up: faster startup, slower first requests |
 | `DECIDER_TIMEOUT` | `180` | Seconds the app waits for a decision |
+| `DECIDER_BACKEND` | `strands` | Which backend `start-model.sh` serves: `strands`, `opendecider`, `lmstudio` |
+| `DECIDER_API_PORT` | `8001` | Port the OpenDecider server binds |
+| `DECIDER_API_ENDPOINT` | `http://127.0.0.1:8001/v1/systemone` | Endpoint the app and comparison tool call for non-strands backends (keep on `DECIDER_API_PORT`) |
+| `DECIDER_API_MODEL` / `DECIDER_API_DEVICE` | preset default | Optional overrides of the non-strands preset's model/device shown in the dashboard |
+| `LMSTUDIO_URL` | `http://10.0.0.177:1234/v1` | LM Studio API base URL (Windows host under WSL2) |
+| `LMSTUDIO_MODEL` | `opendecider-small` | Identifier of the OpenDecider GGUF model loaded in LM Studio |
+
+The original `DECIDER_MODEL` / `DECIDER_DEVICE` / `DECIDER_ENDPOINT` variables apply only to
+the `strands` backend; the other presets use the `DECIDER_API_*` names so a `.env` tuned for the
+local pool cannot accidentally point the dashboard at the wrong server.
+
+## Decision backends and side-by-side comparison
+
+All three backends speak the same `/v1/systemone` contract, so the dashboard and API client work
+unchanged. `start-model.sh` dispatches to whichever `DECIDER_BACKEND` is selected:
+
+- **`strands`** (default) — the original local model, with the optional process pool described
+  below. Numerics are unchanged; the checkpoint is BF16 torso + LoRA r=48 + fp32 head, not
+  quantized.
+- **`opendecider`** — an OpenDecider model served locally by `opendecider serve`. The default is
+  the small `manjunathshiva/opendecider-nano`; override with `DECIDER_API_MODEL`. It uses its own
+  port (`DECIDER_API_PORT`, default 8001) so it can run alongside the strands pool on 8000.
+- **`lmstudio`** — `opendecider serve` reads option probabilities from an OpenDecider model
+  loaded in LM Studio on the Windows host. A plain chat model such as `decider-4b` will **not**
+  work: the answer comes from option-letter log probabilities, not generated text.
+
+Run a local OpenDecider server (set `DECIDER_BACKEND=opendecider` in `.env`, or pass it directly):
+
+```bash
+./start-opendecider.sh opendecider     # nano on http://127.0.0.1:8001
+curl -s localhost:8001/health
+```
+
+For the LM Studio backend, download and load the OpenDecider GGUF model on the Windows host
+first, then start the server from WSL2:
+
+```bash
+# On Windows, in LM Studio (or with its CLI):
+lms get https://huggingface.co/manjunathshiva/opendecider-small-GGUF --select
+lms load opendecider-small@q8_0 --identifier opendecider-small
+lms server stop                 # only if it is already running
+lms server start --bind 0.0.0.0 # WSL2 cannot reach Windows' 127.0.0.1
+
+# In WSL2 — set LMSTUDIO_URL to your Windows host IP if 10.0.0.177 is stale.
+./start-opendecider.sh lmstudio
+```
+
+`lms server start` binds to `127.0.0.1` by default, which WSL2 cannot reach; `--bind 0.0.0.0`
+makes LM Studio listen on the network (including the Windows host IP in `LMSTUDIO_URL`). If you
+changed the bind while the server was up, restart it with `lms server stop` first. The launcher
+sets `OPENDECIDER_REMOTE_URL`, `OPENDECIDER_MODEL=lmstudio:$LMSTUDIO_MODEL` and
+`OPENDECIDER_REMOTE_ALLOW_HTTP=1` for you. Confirm LM Studio is reachable before starting:
+`curl -s http://10.0.0.177:1234/v1/models`.
+
+To compare backends on the built-in scenarios, run the two servers in separate terminals and
+then run the comparison tool. It sends identical requests to each endpoint and reports the top
+answer per question side by side (plus agreement and latency):
+
+```bash
+./start-model.sh                       # strands on 8000
+./start-opendecider.sh opendecider     # OpenDecider on 8001
+.venv/bin/python compare_backends.py --out comparison.json
+
+# Or compare against LM Studio-backed OpenDecider:
+./start-opendecider.sh lmstudio
+.venv/bin/python compare_backends.py --backends strands,lmstudio --out lmstudio.json
+```
+
+Use `--scenario NAME` (repeatable) to limit which scenarios run. Because the two models report
+scores differently — strands gives an expected score, OpenDecider the most likely level — the
+tool rounds the expected score to the nearest level when checking agreement; raw values stay in
+the JSON report.
 
 ## GPU and other machines
 
@@ -188,6 +266,27 @@ WSL2 limits its memory to a share of the host's RAM by default. On a GPU the mod
 in GPU memory, so this rarely matters. On CPU, raise the limit if the server swaps: add
 `memory=16GB` under `[wsl2]` in `%UserProfile%\.wslconfig`, then run `wsl --shutdown`.
 
+### Local fixes applied on `crane`
+
+This machine needed two one-time WSL tweaks. They are already in place; re-running the append
+commands would duplicate the lines.
+
+```bash
+# The venv's PyTorch needs the system CUDA 13 runtime. Keeping torch 2.15 and preloading this
+# library avoids a runtime crash without downgrading torch or changing model numerics.
+printf 'LD_PRELOAD=/usr/local/cuda-13.0/lib64/libcudart.so.13\n' >> .env
+export LD_PRELOAD=/usr/local/cuda-13.0/lib64/libcudart.so.13
+
+# Lets WSL run the Windows LM Studio CLI as `lms` instead of typing its full path.
+echo 'alias lms="/mnt/c/Users/jeff/.lmstudio/bin/lms.exe"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+`LD_PRELOAD` is read when a process starts, so the shell that launches the model server must have
+it exported; the launch scripts also read it from `.env`. The `lms` alias is only for convenience
+from WSL — LM Studio's server still needs `lms server start --bind 0.0.0.0` to be reachable from
+WSL2 (see [Decision backends](#decision-backends-and-side-by-side-comparison)).
+
 ### AMD
 
 PyTorch has ROCm builds for supported AMD GPUs, and they also use the `cuda` device name, so
@@ -240,9 +339,25 @@ Ways to get more out of the hardware:
 |---|---|---|
 | Ask more questions per request | Questions in one request are batched and share the scenario text: the most efficient path | Depends on how the API is used |
 | Install `causal-conv1d` | Faster every request (the server log warns it is using a slow fallback) | Needs the CUDA toolkit (`nvcc`) matching PyTorch's CUDA version; may need a slow source build |
-| Run two server processes behind a load balancer | Avoids interpreter-lock contention | About 4–5 GB of GPU memory per copy, and both still share one GPU |
+| Set `DECIDER_POOL_SIZE=2`–`4` (built in) | Starts that many servers behind a round-robin proxy, avoiding interpreter-lock contention | About 4–5 GB of GPU memory per copy; all copies still share one GPU. Measure 1, 2, 3, 4 — scaling is sublinear |
 | Run on native Linux instead of WSL2 | Lower GPU launch overhead | Different environment |
 | Batch across requests in the server | The real fix for concurrency | Needs changes to, or a wrapper around, `strands-decider`; requests with different scenarios cannot be merged simply |
+
+### Server pool
+
+For a GPU with spare memory, `DECIDER_POOL_SIZE` in `.env` is the simplest concurrency knob:
+
+```bash
+DECIDER_POOL_SIZE=2 ./start-model.sh   # or edit .env
+```
+
+`start-model.sh` starts one server per process on ports `DECIDER_PORT+1` onward, waits for
+all of them, and runs `model_pool.py` as a round-robin proxy on `DECIDER_PORT`. The proxy
+also skips a process that stops answering and reports the first healthy backend's `/health`
+payload, so the dashboard keeps working unchanged. Each decision is still evaluated by one
+server exactly as before — no batching changes and no difference in the answers. Raise the
+value step by step and compare requests/second and p95 latency; stop when throughput flattens.
+`DECIDER_POOL_SIZE=1` keeps the original single-server behaviour.
 
 ## Tests
 
@@ -252,8 +367,8 @@ Ways to get more out of the hardware:
 
 The unit tests cover the API client (request building, validation, connection, timeout,
 HTTP and invalid-response errors, health checks), the load-test statistics (repeats, the
-concurrency limit, partial failures, discarded warm-up requests) and the scenarios, using
-fakes instead of a real server.
+concurrency limit, partial failures, discarded warm-up requests), the server pool, the backend
+presets and the comparison logic, and the scenarios, using fakes instead of a real server.
 `test_live_server_answers_all_types` sends a real request with all three question types when the
 model server is running, and is skipped otherwise.
 
@@ -263,11 +378,13 @@ model server is running, and is skipped otherwise.
 app.py               Streamlit dashboard
 api_client.py        HTTP client, request building and response validation
 benchmark.py         Repeated and concurrent requests, latency statistics
-config.py            Settings from the environment / .env
+compare_backends.py  Run scenarios against two backends and compare their answers
+config.py            Settings from the environment / .env, including backend presets
+model_pool.py        Round-robin proxy and readiness check for a server pool
 hardware.py          Hardware diagnostics (also runnable: .venv/bin/python hardware.py)
 scenarios/examples.py  The four built-in scenarios
 tests/               pytest suite
-setup.sh, start-model.sh, start-demo.sh, run-tests.sh
+setup.sh, start-model.sh, start-opendecider.sh, start-demo.sh, run-tests.sh
 ```
 
 If you move or rename this folder, delete `.venv` and run `./setup.sh` again, because a

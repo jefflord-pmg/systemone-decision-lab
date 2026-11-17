@@ -6,7 +6,9 @@ The model is reached only over HTTP through api_client; nothing here loads it.
 from __future__ import annotations
 
 import json
+import os
 import uuid
+from importlib.metadata import PackageNotFoundError, version as package_version
 
 import altair as alt
 import pandas as pd
@@ -30,13 +32,27 @@ TYPE_LABELS = {"noul": "NOUL · yes/no", "choice": "CHOICE · pick one", "score"
 ACCENT = "#7C5CFF"
 MUTED = "#3A3F55"
 
+
+def _version(name: str) -> str:
+    """Installed package version, or a short fallback when it is not installed."""
+    try:
+        return package_version(name)
+    except PackageNotFoundError:
+        return "not installed"
+
+
 st.set_page_config(page_title="SystemOne Decision Lab", page_icon="◆", layout="wide")
 
 st.markdown(
     """
     <style>
-    .block-container {padding-top: 2rem; max-width: 1400px;}
+    .block-container {padding-top: 5rem; max-width: 1400px;}
+    /* Streamlit's branding and toolbar sat on top of the heading; keep the page clean. */
+    footer, div[data-testid="stFooter"] {visibility: hidden;}
+    div[data-testid="stToolbar"] {display: none;}
+    header[data-testid="stHeader"] {background: transparent;}
     .lab-title {font-size: 2.1rem; font-weight: 800; letter-spacing: .18em; margin: 0;
+        line-height: 1.25; padding-bottom: .25rem; color: #B4A2FF;
         background: linear-gradient(90deg, #7C5CFF, #22D3EE); -webkit-background-clip: text;
         -webkit-text-fill-color: transparent;}
     .lab-sub {color: #9AA3B8; margin-top: -.2rem; margin-bottom: 1.2rem;}
@@ -168,6 +184,31 @@ with st.sidebar:
     st.selectbox("Load a scenario", [*SCENARIOS, CUSTOM], key="scenario",
                  on_change=load_scenario, label_visibility="collapsed")
     st.caption("Demo inputs only. Answers come from the model, not from the scenario.")
+
+    st.subheader("Configuration")
+    config_rows = {
+        "Backend": settings.backend,
+        "Model": settings.model,
+        "Device": settings.device,
+        "Endpoint": settings.endpoint,
+        "Timeout": f"{settings.timeout:.0f} s",
+    }
+    if settings.backend == "strands":
+        config_rows["Server pool"] = f"{os.environ.get('DECIDER_POOL_SIZE', '1')} process(es)"
+    elif settings.backend == "lmstudio":
+        config_rows["LM Studio URL"] = os.environ.get("LMSTUDIO_URL", "—")
+        config_rows["LM Studio model"] = os.environ.get("LMSTUDIO_MODEL", "—")
+    st.markdown("\n".join(f"- **{k}:** `{v}`" for k, v in config_rows.items()))
+    st.caption("From `.env`; live model and device are in the status bar above.")
+
+    st.subheader("Software")
+    software_rows = {
+        "Streamlit": st.__version__,
+        "strands-decider": _version("strands-decider"),
+        "OpenDecider": _version("opendecider"),
+    }
+    st.markdown("\n".join(f"- **{k}:** {v}" for k, v in software_rows.items()))
+    st.caption("Python, PyTorch and GPU details are under Hardware below.")
 
     st.subheader("Hardware")
     hw = get_hardware(settings.device)

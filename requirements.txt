@@ -1,5 +1,7 @@
 # PyTorch is installed separately by setup.sh from the CPU-only wheel index.
 strands-decider==0.3.0
+# Second decision backend: serves /v1/systemone from an OpenDecider model or LM Studio.
+opendecider[serve]>=0.2.1
 streamlit>=1.40
 requests>=2.32
 pytest>=8.0

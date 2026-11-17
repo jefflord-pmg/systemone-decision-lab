@@ -188,12 +188,14 @@ def test_health_offline(session):
 
 
 def test_settings_from_environment(monkeypatch):
+    monkeypatch.setenv("DECIDER_BACKEND", "strands")
     monkeypatch.setenv("DECIDER_MODEL", "some/model")
     monkeypatch.setenv("DECIDER_DEVICE", "cuda")
     monkeypatch.setenv("DECIDER_ENDPOINT", "http://localhost:9000/v1/systemone")
     monkeypatch.setenv("DECIDER_TIMEOUT", "30")
     settings = get_settings()
-    assert settings == Settings("some/model", "cuda", "http://localhost:9000/v1/systemone", 30.0)
+    assert settings == Settings("some/model", "cuda", "http://localhost:9000/v1/systemone",
+                                30.0, backend="strands")
     assert settings.health_url == "http://localhost:9000/health"
 
 
