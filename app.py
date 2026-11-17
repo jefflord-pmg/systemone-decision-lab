@@ -15,13 +15,13 @@ import streamlit as st
 import hardware
 from api_client import (
     DeciderClient,
-    DeciderError,
     Question,
     QuestionError,
     parse_levels,
     parse_options,
     slugify,
 )
+from benchmark import MAX_CONCURRENCY, MAX_REPEATS, BenchmarkResult, run_benchmark
 from config import get_settings
 from scenarios import SCENARIOS
 
@@ -58,6 +58,11 @@ settings = get_settings()
 
 @st.cache_resource
 def get_client() -> DeciderClient:
+    return DeciderClient(settings.endpoint, settings.health_url, timeout=settings.timeout)
+
+
+def new_client() -> DeciderClient:
+    """A client with its own HTTP session, one per load-test thread."""
     return DeciderClient(settings.endpoint, settings.health_url, timeout=settings.timeout)
 
 
@@ -196,9 +201,19 @@ with left:
                  placeholder="Describe the situation the model should decide about…")
 
     st.subheader("C · Run")
+    load = st.columns(3)
+    load[0].number_input("Repeat", min_value=1, max_value=MAX_REPEATS, value=1, step=1,
+                         key="repeats", help="Total number of requests to send.")
+    load[1].number_input("Concurrency", min_value=1, max_value=MAX_CONCURRENCY, value=1, step=1,
+                         key="concurrency",
+                         help="Requests in flight at once. Capped at Repeat.")
+    load[2].number_input("Discard first", min_value=0, max_value=MAX_REPEATS - 1, value=0, step=1,
+                         key="discard",
+                         help="Leave the first N requests out of the latency statistics "
+                              "(warm-up). They still count toward throughput.")
     run = st.button("Run decision", type="primary", width="stretch")
-    st.caption(f"All questions go in one POST to `{settings.endpoint}`. "
-               f"Timeout {settings.timeout:.0f} s.")
+    st.caption(f"Each request sends all questions in one POST to `{settings.endpoint}`. "
+               f"Timeout {settings.timeout:.0f} s per request.")
 
 with right:
     st.subheader("B · Decision builder")
@@ -247,18 +262,33 @@ if run:
         for i, e in enumerate(st.session_state.questions)
     ]
     st.session_state.error = None
+    repeats = int(st.session_state.repeats)
+    progress = st.progress(0.0, text=f"Sending {repeats} request(s)… "
+                                     "(CPU inference can take a while)")
+
+    def on_progress(done: int, total: int) -> None:
+        progress.progress(done / total, text=f"{done} of {total} requests finished")
+
     try:
-        with st.spinner("Asking the model… (CPU inference can take a while)"):
-            result = client.decide(st.session_state.state_text, questions)
-    except (QuestionError, DeciderError) as exc:
+        bench = run_benchmark(new_client, st.session_state.state_text, questions,
+                              repeats=repeats,
+                              concurrency=int(st.session_state.concurrency),
+                              discard=int(st.session_state.discard),
+                              on_progress=on_progress)
+    except QuestionError as exc:
         st.session_state.error = str(exc)
         st.session_state.result = None
     else:
-        st.session_state.result = {"data": result.data, "round_trip_ms": result.round_trip_ms,
-                                   "server_ms": result.server_latency_ms,
-                                   "questions": questions}
-        st.session_state.decisions += 1
-        st.session_state.last_latency = result.round_trip_ms
+        st.session_state.decisions += len(bench.samples)
+        last = bench.last
+        if last is None:
+            st.session_state.error = bench.first_error or "No request succeeded."
+            st.session_state.result = None
+        else:
+            st.session_state.result = {"data": last.data, "round_trip_ms": last.round_trip_ms,
+                                       "server_ms": last.server_latency_ms,
+                                       "questions": questions, "bench": bench}
+            st.session_state.last_latency = last.round_trip_ms
     st.rerun()
 
 
@@ -332,6 +362,58 @@ def render_answer(question: Question, answer: dict) -> None:
                             width="stretch")
 
 
+def render_load_test(bench: BenchmarkResult) -> None:
+    with st.container(border=True):
+        st.markdown(f"**Load test** <span class='caption'>· {bench.repeats} requests, "
+                    f"up to {bench.concurrency} at once</span>", unsafe_allow_html=True)
+        m = st.columns(4)
+        m[0].metric("Succeeded", f"{bench.succeeded} / {bench.repeats}")
+        m[1].metric("Wall time", f"{bench.wall_ms / 1000:,.2f} s",
+                    help="From the first request sent to the last one finished.")
+        m[2].metric("Throughput", f"{bench.throughput:,.2f} req/s",
+                    help="Successful requests per second over the whole run, warm-up included.")
+        m[3].metric("Discarded", bench.discard,
+                    help="First requests left out of the latency statistics.")
+        if bench.failed:
+            st.warning(f"{bench.failed} request(s) failed. First error: {bench.first_error}",
+                       icon="⚠️")
+
+        rows = {"Round trip": bench.round_trip_stats(),
+                "Server latency": bench.server_stats(),
+                "Round trip − server": bench.overhead_stats()}
+        table = pd.DataFrame(
+            {name: [s.min, s.avg, s.p50, s.p95, s.max] for name, s in rows.items() if s},
+            index=["min", "avg", "p50", "p95", "max"],
+        ).T
+        if table.empty:
+            st.info("No requests left to measure after discarding the warm-up.")
+        else:
+            st.dataframe(table.style.format("{:,.0f} ms"), width="stretch")
+            st.caption("Statistics cover the successful requests after the discarded ones. "
+                       "Round trip − server is time spent waiting for a server thread, "
+                       "plus HTTP.")
+
+        points = [
+            {"request": s.index + 1, "series": series, "ms": value,
+             "discarded": s.index < bench.discard}
+            for s in bench.samples if s.ok
+            for series, value in (("Round trip", s.round_trip_ms), ("Server latency", s.server_ms))
+            if value is not None
+        ]
+        if points:
+            chart = alt.Chart(pd.DataFrame(points)).mark_line(point=True).encode(
+                x=alt.X("request:Q", title="request # (order sent)",
+                        axis=alt.Axis(tickMinStep=1, format="d")),
+                y=alt.Y("ms:Q", title="latency (ms)"),
+                color=alt.Color("series:N", title=None,
+                                scale=alt.Scale(range=[ACCENT, "#22D3EE"]),
+                                legend=alt.Legend(orient="top")),
+                tooltip=[alt.Tooltip("request:Q"), alt.Tooltip("series:N"),
+                         alt.Tooltip("ms:Q", format=",.0f"), alt.Tooltip("discarded:N")],
+            ).properties(height=240)
+            st.altair_chart(chart, width="stretch")
+
+
 st.divider()
 st.subheader("D · Results")
 
@@ -342,6 +424,11 @@ result = st.session_state.get("result")
 if result:
     data = result["data"]
     usage = data.get("usage", {})
+    bench = result.get("bench")
+    if bench is not None and bench.repeats > 1:
+        render_load_test(bench)
+        st.markdown(f"**Last response** <span class='caption'>· the most recent successful "
+                    f"response of {bench.repeats}</span>", unsafe_allow_html=True)
     m = st.columns(4)
     m[0].metric("Round trip", f"{result['round_trip_ms']:,.0f} ms", help="Measured by this app.")
     m[1].metric("Server latency",

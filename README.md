@@ -47,6 +47,7 @@ The Streamlit app never imports or loads the model; it only calls the server ove
 - RAM: on CPU the 2B model loads in fp32, and this machine measured about 6.3 GB for the server.
   Leave around 10 GB free to avoid swapping. On a GPU the weights go to GPU memory instead.
 - About 6 GB of disk for the model (cached in `~/.cache/huggingface`)
+- For `--cuda`: a C compiler and Python headers (`sudo apt install build-essential python3-dev`)
 
 ## Setup
 
@@ -87,6 +88,14 @@ curl -s localhost:8000/health
 Open <http://127.0.0.1:8501>. Pick a scenario in the sidebar (or "Custom (blank)"), edit the
 situation and the questions, and press **Run decision**. All questions go to the server in one
 POST.
+
+To measure latency, set **Repeat** (total requests, up to 200), **Concurrency** (requests in
+flight at once, up to 16) and **Discard first** (warm-up requests left out of the statistics)
+before pressing **Run decision**. With more than one request, the results add a **Load test**
+panel: success count, wall time, throughput, min/avg/p50/p95/max for round trip and server
+latency, and a latency chart per request. The answers shown are from the last successful
+response. The requests are sent by the dashboard's Python process, not the browser. See
+[Concurrency](#concurrency).
 
 ## Configuration
 
@@ -140,6 +149,23 @@ linear-attention layers; without it the model still works on a slower reference 
 `causal-conv1d` is another optional kernel. It needs the CUDA toolkit (`nvcc`) to build:
 `.venv/bin/pip install causal-conv1d --no-build-isolation`.
 
+**Triton needs a C compiler.** The first time a Triton kernel runs, Triton compiles a small C
+helper, which needs a C compiler and the Python development headers (`Python.h`). Without
+them, the server crashes during warm-up with
+`RuntimeError: Failed to find C compiler. Please specify via CC environment variable`.
+Minimal Ubuntu and WSL installs often have neither. Install them before `./setup.sh --cuda`:
+
+```bash
+sudo apt install build-essential python3-dev
+```
+
+`setup.sh --cuda` skips `flash-linear-attention` when these are missing and prints this
+command. `hardware.py --test-gpu` runs a small Triton kernel, so the GPU check fails with the
+same advice if `flash-linear-attention` is installed but cannot run; `start-model.sh` then
+falls back to CPU instead of crashing. After installing the tools, restart the server; if
+setup skipped the kernels, run `./setup.sh --cuda` again first. To use the GPU without the
+fast kernels instead, run `.venv/bin/python -m pip uninstall -y flash-linear-attention`.
+
 ### NVIDIA under WSL2 (Windows)
 
 WSL2 gets GPU access through the **Windows** NVIDIA driver.
@@ -153,8 +179,10 @@ WSL2 gets GPU access through the **Windows** NVIDIA driver.
 4. Install uv (recommended, provides Python 3.12):
    `curl -LsSf https://astral.sh/uv/install.sh | sh`, then open a new terminal.
    Without uv on Ubuntu, install `python3.12` and `python3.12-venv` with apt.
-5. Run `./setup.sh --cuda`, then the two-terminal workflow above.
-6. Open <http://localhost:8501> in a Windows browser. WSL2 forwards localhost ports to Windows.
+5. Install a C compiler and the Python headers for Triton (see above):
+   `sudo apt install build-essential python3-dev`.
+6. Run `./setup.sh --cuda`, then the two-terminal workflow above.
+7. Open <http://localhost:8501> in a Windows browser. WSL2 forwards localhost ports to Windows.
 
 WSL2 limits its memory to a share of the host's RAM by default. On a GPU the model weights live
 in GPU memory, so this rarely matters. On CPU, raise the limit if the server swaps: add
@@ -185,6 +213,37 @@ about 2.5 minutes of startup (download excluded). Upstream measured a median of 
 per question on an RTX 3090. Actual speed and memory depend on the GPU, the software
 versions and the request size.
 
+### Concurrency
+
+Expect each request to get slower as you raise **Concurrency**. The cause is the model server,
+not the dashboard: in the load test, "Round trip − server" (the time the dashboard and HTTP
+add) stays at a few milliseconds.
+
+- **No batching across requests.** `strands-decider serve` handles each request on its own
+  thread, with no lock on CUDA, so concurrent requests all start at once. But each one runs
+  its own forward passes. The server batches only the questions *within* one request
+  (`DECIDER_MAX_BATCH`); it has no option to merge separate requests.
+- **One process, one GPU.** The request threads share Python's interpreter lock and the GPU,
+  so they mostly take turns.
+- **Launch-bound workload.** A 2B model on a few hundred tokens runs many small GPU
+  operations, so the overhead of launching each one dominates. WSL2 adds overhead per launch.
+
+Throughput is the number to watch. Keep **Repeat** fixed (for example 32) and step
+**Concurrency** through 1, 2, 4 and 8: while requests per second rise, the hardware is still
+gaining from concurrency; once they flatten, extra concurrency only adds latency. As one
+example, an RTX 3080 under WSL2 ran 6 requests with three questions each, 3 at a time, at
+about 4.9 requests per second and about 590 ms average latency.
+
+Ways to get more out of the hardware:
+
+| Option | Effect | Caveat |
+|---|---|---|
+| Ask more questions per request | Questions in one request are batched and share the scenario text: the most efficient path | Depends on how the API is used |
+| Install `causal-conv1d` | Faster every request (the server log warns it is using a slow fallback) | Needs the CUDA toolkit (`nvcc`) matching PyTorch's CUDA version; may need a slow source build |
+| Run two server processes behind a load balancer | Avoids interpreter-lock contention | About 4–5 GB of GPU memory per copy, and both still share one GPU |
+| Run on native Linux instead of WSL2 | Lower GPU launch overhead | Different environment |
+| Batch across requests in the server | The real fix for concurrency | Needs changes to, or a wrapper around, `strands-decider`; requests with different scenarios cannot be merged simply |
+
 ## Tests
 
 ```bash
@@ -192,7 +251,9 @@ versions and the request size.
 ```
 
 The unit tests cover the API client (request building, validation, connection, timeout,
-HTTP and invalid-response errors, health checks) and the scenarios, using a fake HTTP session.
+HTTP and invalid-response errors, health checks), the load-test statistics (repeats, the
+concurrency limit, partial failures, discarded warm-up requests) and the scenarios, using
+fakes instead of a real server.
 `test_live_server_answers_all_types` sends a real request with all three question types when the
 model server is running, and is skipped otherwise.
 
@@ -201,6 +262,7 @@ model server is running, and is skipped otherwise.
 ```
 app.py               Streamlit dashboard
 api_client.py        HTTP client, request building and response validation
+benchmark.py         Repeated and concurrent requests, latency statistics
 config.py            Settings from the environment / .env
 hardware.py          Hardware diagnostics (also runnable: .venv/bin/python hardware.py)
 scenarios/examples.py  The four built-in scenarios

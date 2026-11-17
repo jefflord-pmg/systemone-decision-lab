@@ -104,6 +104,41 @@ def collect(configured_device: str | None = None) -> dict:
     return info
 
 
+def missing_build_tools() -> list[str]:
+    """What Triton needs to JIT-compile its CUDA helper, but is absent."""
+    import sysconfig
+
+    missing = []
+    if not any(shutil.which(cc) for cc in ("cc", "gcc", "clang")):
+        missing.append("a C compiler")
+    if not (Path(sysconfig.get_paths()["include"]) / "Python.h").exists():
+        missing.append("Python development headers (Python.h)")
+    return missing
+
+
+def _test_triton() -> str | None:
+    """Compile and run a tiny Triton kernel. Returns an error message, or None if it works."""
+    try:
+        import torch
+        import triton
+        import triton.language as tl
+
+        @triton.jit
+        def _add_one(x_ptr, n, BLOCK: tl.constexpr):
+            offs = tl.arange(0, BLOCK)
+            mask = offs < n
+            tl.store(x_ptr + offs, tl.load(x_ptr + offs, mask=mask) + 1, mask=mask)
+
+        x = torch.zeros(16, device="cuda")
+        _add_one[(1,)](x, 16, BLOCK=16)
+        torch.cuda.synchronize()
+        if x.sum().item() != 16:
+            return "Triton kernel returned a wrong result"
+    except Exception as exc:
+        return str(exc).strip().splitlines()[0] if str(exc).strip() else type(exc).__name__
+    return None
+
+
 def test_gpu() -> bool:
     """Run a small bf16 matmul on the GPU. True only if it computes the right answer."""
     try:
@@ -131,10 +166,22 @@ def test_gpu() -> bool:
     print(f"GPU test: OK on {name}, {free / 2**30:.1f} of {total / 2**30:.1f} GiB free.")
     try:
         import fla  # noqa: F401
-        print("GPU test: flash-linear-attention available (fast kernels).")
     except Exception:
         print("GPU test: flash-linear-attention not available; the model uses slower fallbacks.")
-    return True
+        return True
+    error = _test_triton()
+    if error is None:
+        print("GPU test: flash-linear-attention available (fast kernels).")
+        return True
+    # transformers uses fla whenever it is installed, so a broken Triton crashes the server.
+    print(f"GPU test: flash-linear-attention is installed but its Triton kernels fail: {error}")
+    missing = missing_build_tools()
+    if missing:
+        print(f"  Triton needs {' and '.join(missing)} to compile its GPU helper.")
+        print("  On Ubuntu/Debian: sudo apt install build-essential python3-dev")
+    print("  Or remove the fast kernels and use the GPU without them:")
+    print("    .venv/bin/python -m pip uninstall -y flash-linear-attention")
+    return False
 
 
 if __name__ == "__main__":

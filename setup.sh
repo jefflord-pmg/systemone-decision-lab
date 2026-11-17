@@ -49,8 +49,16 @@ if [ "$MODE" = "cuda" ]; then
     fi
     # Triton kernels for the Gated DeltaNet layers. Optional: without them transformers
     # uses a slower reference path. causal-conv1d is also optional and needs nvcc to build.
-    "${PIP[@]}" install flash-linear-attention \
-        || echo "flash-linear-attention failed to install; continuing without it (slower)."
+    # Triton compiles a C helper at runtime, so it needs a C compiler and Python.h.
+    MISSING_TOOLS=$(.venv/bin/python -c "import hardware; print(' and '.join(hardware.missing_build_tools()))")
+    if [ -z "$MISSING_TOOLS" ]; then
+        "${PIP[@]}" install flash-linear-attention \
+            || echo "flash-linear-attention failed to install; continuing without it (slower)."
+    else
+        echo "Skipping flash-linear-attention: Triton needs $MISSING_TOOLS."
+        echo "  For the fast kernels: sudo apt install build-essential python3-dev, then re-run ./setup.sh --cuda"
+        "${PIP[@]}" uninstall -y flash-linear-attention 2>/dev/null || true
+    fi
 else
     # CPU-only wheels avoid several GB of CUDA libraries.
     "${PIP[@]}" install torch --index-url "${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cpu}"
